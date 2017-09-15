@@ -5,13 +5,20 @@ import pytest
 from datetime import datetime, timedelta
 from itertools import count
 
+from django.contrib.admin.sites import AdminSite
+from django.contrib.messages.storage.fallback import FallbackStorage
+from django.test import RequestFactory
+
 from celery.five import monotonic, text_t
-from celery.schedules import schedule, crontab
+from celery.schedules import schedule, crontab, solar
 
 from django_celery_beat import schedulers
+from django_celery_beat.admin import PeriodicTaskAdmin
 from django_celery_beat.models import (
     PeriodicTask, PeriodicTasks, IntervalSchedule, CrontabSchedule,
+    SolarSchedule
 )
+from django_celery_beat.utils import make_aware
 
 _ids = count(0)
 
@@ -63,6 +70,11 @@ class SchedulerCase:
         crontab = CrontabSchedule.from_schedule(schedule)
         crontab.save()
         return self.create_model(crontab=crontab, **kwargs)
+
+    def create_model_solar(self, schedule, **kwargs):
+        solar = SolarSchedule.from_schedule(schedule)
+        solar.save()
+        return self.create_model(solar=solar, **kwargs)
 
     def create_conf_entry(self):
         name = 'thefoo{0}'.format(next(_ids))
@@ -176,20 +188,27 @@ class test_DatabaseScheduler(SchedulerCase):
             schedule(timedelta(seconds=10)))
         self.m1.save()
         self.m1.refresh_from_db()
+
         self.m2 = self.create_model_interval(
             schedule(timedelta(minutes=20)))
         self.m2.save()
         self.m2.refresh_from_db()
+
         self.m3 = self.create_model_crontab(
             crontab(minute='2,4,5'))
         self.m3.save()
         self.m3.refresh_from_db()
 
+        self.m4 = self.create_model_solar(
+            solar('solar_noon', 48.06, 12.86))
+        self.m4.save()
+        self.m4.refresh_from_db()
+
         # disabled, should not be in schedule
-        m4 = self.create_model_interval(
+        m5 = self.create_model_interval(
             schedule(timedelta(seconds=1)))
-        m4.enabled = False
-        m4.save()
+        m5.enabled = False
+        m5.save()
 
         self.s = self.Scheduler(app=self.app)
 
@@ -201,7 +220,7 @@ class test_DatabaseScheduler(SchedulerCase):
     def test_all_as_schedule(self):
         sched = self.s.schedule
         assert sched
-        assert len(sched) == 4
+        assert len(sched) == 5
         assert 'celery.backend_cleanup' in sched
         for n, e in sched.items():
             assert isinstance(e, self.s.Entry)
@@ -374,6 +393,14 @@ class test_models(SchedulerCase):
         ))
         assert text_t(p) == '{0}: * 4,5 4,5 * * (m/h/d/dM/MY)'.format(p.name)
 
+    def test_PeriodicTask_unicode_solar(self):
+        p = self.create_model_solar(
+            solar('solar_noon', 48.06, 12.86), name='solar_event'
+        )
+        assert text_t(p) == 'solar_event: {0} ({1}, {2})'.format(
+            'solar_noon', '48.06', '12.86'
+        )
+
     def test_PeriodicTask_schedule_property(self):
         p1 = self.create_model_interval(schedule(timedelta(seconds=10)))
         s1 = p1.schedule
@@ -410,6 +437,18 @@ class test_models(SchedulerCase):
         assert s.schedule.day_of_month == {1, 16}
         assert s.schedule.month_of_year == {1, 7}
 
+    def test_SolarSchedule_schedule(self):
+        s = SolarSchedule(event='solar_noon', latitude=48.06, longitude=12.86)
+        dt = datetime(day=25, month=7, year=2017, hour=12, minute=0)
+        dt_lastrun = make_aware(dt)
+
+        assert s.schedule is not None
+
+        isdue, nextcheck = s.schedule.is_due(dt_lastrun)
+        assert isdue is False  # False means scheduler needs to keep checking.
+        assert (nextcheck > 0) and (isdue is False) or \
+            (nextcheck == s.max_interval) and (isdue is True)
+
 
 @pytest.mark.django_db()
 class test_model_PeriodicTasks(SchedulerCase):
@@ -425,3 +464,48 @@ class test_model_PeriodicTasks(SchedulerCase):
         y = PeriodicTasks.last_change()
         assert y
         assert y > x
+
+
+@pytest.mark.django_db()
+class test_modeladmin_PeriodicTaskAdmin(SchedulerCase):
+    @pytest.mark.django_db()
+    @pytest.fixture(autouse=True)
+    def setup_scheduler(self, app):
+        self.app = app
+        self.site = AdminSite()
+        self.request_factory = RequestFactory()
+
+        entry_name, entry = self.create_conf_entry()
+        self.app.conf.beat_schedule = {entry_name: entry}
+        self.m1 = PeriodicTask(name=entry_name)
+        self.m1.task = 'celery.backend_cleanup'
+        self.m1.save()
+
+        entry_name, entry = self.create_conf_entry()
+        self.app.conf.beat_schedule = {entry_name: entry}
+        self.m2 = PeriodicTask(name=entry_name)
+        self.m2.task = 'celery.backend_cleanup'
+        self.m2.save()
+
+    def patch_request(self, request):
+        """patch request to allow for django messages storage"""
+        setattr(request, 'session', 'session')
+        messages = FallbackStorage(request)
+        setattr(request, '_messages', messages)
+        return request
+
+    def test_run_task(self):
+        ma = PeriodicTaskAdmin(PeriodicTask, self.site)
+        self.request = self.patch_request(self.request_factory.get('/'))
+        ma.run_tasks(self.request, PeriodicTask.objects.filter(id=self.m1.id))
+        assert len(self.request._messages._queued_messages) == 1
+        queued_message = self.request._messages._queued_messages[0].message
+        assert queued_message == '1 task was successfully run'
+
+    def test_run_tasks(self):
+        ma = PeriodicTaskAdmin(PeriodicTask, self.site)
+        self.request = self.patch_request(self.request_factory.get('/'))
+        ma.run_tasks(self.request, PeriodicTask.objects.all())
+        assert len(self.request._messages._queued_messages) == 1
+        queued_message = self.request._messages._queued_messages[0].message
+        assert queued_message == '2 tasks were successfully run'
